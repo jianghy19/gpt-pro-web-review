@@ -1,0 +1,16 @@
+{
+  "default_project_name": "My Review Project",
+  "default_project_key": "my_review_project",
+  "default_project_url": "https://chatgpt.com/g/g-p-your-project/project",
+  "mode_label": "进阶专业",
+  "default_concurrency": 5,
+  "max_concurrency": 6,
+  "project_routes": [
+    {
+      "path_prefix": "~/projects/my-important-project",
+      "project_name": "My Important Project",
+      "project_key": "my_important_project",
+      "project_url": "https://chatgpt.com/g/g-p-your-other-project/project"
+    }
+  ]
+}

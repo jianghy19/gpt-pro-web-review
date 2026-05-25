@@ -1,0 +1,41 @@
+{
+  "name": "gpt-pro-web-review",
+  "version": "0.1.0",
+  "description": "Chrome-backed ChatGPT Pro web review workflow for large project review bundles.",
+  "author": {
+    "name": "Jiang Hanyu",
+    "email": "",
+    "url": ""
+  },
+  "homepage": "",
+  "repository": "",
+  "license": "MIT",
+  "keywords": [
+    "chatgpt",
+    "gpt-pro",
+    "review",
+    "chrome",
+    "local"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GPT Pro Web Review",
+    "shortDescription": "Run Chrome-backed ChatGPT Pro project reviews.",
+    "longDescription": "Provides a home-local Codex skill and gpt-review command for read-only project reviews through ChatGPT web in Chrome. It prepares review bundles, uploads them to a fixed ChatGPT Project, supports watch and detach/resume modes, keeps remote files as archive, deletes local upload zips after confirmed upload, and runs parallel review tabs with safe cleanup.",
+    "developerName": "Jiang Hanyu",
+    "category": "Productivity",
+    "capabilities": [
+      "Review",
+      "Chrome",
+      "Local"
+    ],
+    "defaultPrompt": [
+      "Use GPT Pro to review this project plan.",
+      "Prepare a GPT Pro web review bundle for this repository.",
+      "Resume the detached GPT Pro review and extract the result."
+    ],
+    "brandColor": "#10A37F",
+    "composerIcon": "./assets/gpt-pro-icon.png",
+    "logo": "./assets/gpt-pro-icon.png"
+  }
+}
