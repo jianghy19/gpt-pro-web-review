@@ -1,5 +1,7 @@
 # GPT Pro Web Review
 
+[中文安装与配置说明](README.zh-CN.md)
+
 Chrome-backed local plugin for using ChatGPT web Pro mode as a read-only project reviewer.
 
 This plugin prepares a local review bundle, uploads it to a fixed ChatGPT Project in Chrome, extracts the final review, and saves artifacts under:
