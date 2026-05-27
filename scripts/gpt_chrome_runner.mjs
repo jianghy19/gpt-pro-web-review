@@ -25,9 +25,11 @@ const RUNTIME_INSTANCE_ID = `${Date.now()}-${Math.random().toString(16).slice(2)
 const SECRET_KEY_RE =
   /(^|[_-])(token|api[_-]?key|authorization|auth[_-]?token|secret|password|credential|cookie|csrf|bearer)([_-]|$)|(^|[_-])session([_-]?(id|token|cookie|secret|key))([_-]|$)/i;
 const HANDOFF_STATUSES = new Set([
+  "chrome_handoff_required",
   "login_required",
   "human_verification_required",
   "project_not_found",
+  "mode_confirmation_required",
   "mode_unavailable",
   "upload_failed",
   "submit_failed",
@@ -35,8 +37,10 @@ const HANDOFF_STATUSES = new Set([
   "submit_button_unavailable",
   "project_mismatch",
   "extract_failed",
+  "manual_copy_required",
   "detached",
   "kept_open",
+  "resume_tab_missing",
   "tab_lost",
   "timeout",
   "error",
@@ -75,6 +79,34 @@ function redactValue(value) {
   }
   if (typeof value === "string") return sanitizeText(value);
   return value;
+}
+
+function sanitizeSessionPart(value, maxLength = 48) {
+  return String(value || "")
+    .replace(/[^A-Za-z0-9._-]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, maxLength);
+}
+
+function runSessionNameForStatus(status = {}) {
+  const topic = sanitizeSessionPart(status.topic || status.requested_topic || status.registry_key || "review", 42) || "review";
+  const runId = sanitizeSessionPart(status.run_id || path.basename(String(status.run_dir || "")), 22) || "run";
+  return `GPT Pro review ${topic} ${runId}`;
+}
+
+async function nameSessionForStatus(browser, status = {}) {
+  await browser.nameSession(runSessionNameForStatus(status)).catch(() => {});
+}
+
+async function newRunTab(browser, status = {}) {
+  await nameSessionForStatus(browser, status);
+  return await browser.tabs.new();
+}
+
+function submittedStatePatch(submitted = {}) {
+  const status = String(submitted.status || "");
+  return { state: status === "generating" ? "generating" : "submitted" };
 }
 
 async function writeJsonAtomic(targetPath, value) {
@@ -306,6 +338,151 @@ function classifyChatGptPage(text) {
   return "ok";
 }
 
+function normalizeChatGptSurface(raw = {}, currentUrl = "", knownText = "") {
+  const text = sanitizeText(raw.bodyText || knownText || "").slice(0, 200000);
+  const articleCount = Number(raw.articleCount || 0);
+  const hasConversationUrl = isConversationUrl(currentUrl);
+  const hasAssistantArticle = Boolean(raw.hasAssistantArticle);
+  const hasComposer = Boolean(raw.hasComposer);
+  const hasConversationStructure = Boolean(raw.hasConversationStructure || articleCount > 0 || hasAssistantArticle);
+  const hasFinalReview = looksLikeFinalReviewResponse(stripThinkingText(text).trim()) ||
+    /GPT Pro web review[\s\S]{0,5000}Review State/i.test(text);
+  const hasConversationSurface = Boolean(
+    hasConversationStructure ||
+      hasAssistantArticle ||
+      articleCount > 0 ||
+      (hasConversationUrl && hasComposer) ||
+      hasFinalReview,
+  );
+  const hasLoginForm = Boolean(raw.hasLoginForm);
+  const hasHumanVerificationControl = Boolean(raw.hasHumanVerificationControl ?? raw.hasHumanVerification);
+  const hasHumanVerificationBody = Boolean(
+    raw.hasHumanVerificationBody ||
+      /(captcha|verify you are human|cloudflare|验证你是真人|人机验证)/i.test(text),
+  );
+  const hasPageErrorControl = Boolean(raw.hasPageErrorControl ?? raw.hasPageError);
+  const hasPageErrorBody = /(something went wrong|network error|try again later|出了点问题|网络错误)/i.test(text);
+  return {
+    ...raw,
+    text,
+    url: currentUrl,
+    articleCount,
+    hasConversationUrl,
+    hasAssistantArticle,
+    hasComposer,
+    hasConversationStructure,
+    hasConversationSurface,
+    hasLoginForm,
+    hasHumanVerificationControl,
+    hasHumanVerificationBody,
+    hasPageErrorControl,
+    hasPageErrorBody,
+    fallbackTextState: classifyChatGptPage(text),
+  };
+}
+
+async function probeChatGptSurface(tab, knownText = "") {
+  const currentUrl = await tab.url().catch(() => "");
+  const raw = await tab.playwright
+    .evaluate(() => {
+      const bodyText = document.body ? document.body.innerText || "" : "";
+      const articles = [...document.querySelectorAll("article")];
+      const articleTexts = articles.map((article) => article.innerText || article.textContent || "");
+      const hasAssistantArticle = articles.some((article, index) => {
+        const text = articleTexts[index] || "";
+        const role =
+          article.getAttribute("data-message-author-role") ||
+          article.querySelector("[data-message-author-role]")?.getAttribute("data-message-author-role") ||
+          "";
+        return /assistant/i.test(role) || /(GPT Pro web review|Review State|Blockers|Important findings|Direct answer)/i.test(text);
+      });
+      const hasComposer = Boolean(
+        document.querySelector('textarea, [contenteditable="true"], [data-testid*="composer" i], [class*="ProseMirror"]'),
+      );
+      const hasConversationStructure = Boolean(
+        articles.length ||
+          document.querySelector('main [data-message-author-role], [data-testid*="conversation" i], [data-testid*="thread" i]'),
+      );
+      const controlText = [...document.querySelectorAll([
+        "form",
+        "button",
+        "a[href*='auth' i]",
+        "a[href*='login' i]",
+        "[role='button']",
+        "input",
+        "[role='dialog']",
+        "[role='alert']",
+        "[data-testid*='login' i]",
+        "[data-testid*='auth' i]",
+        "[class*='login' i]",
+        "[class*='auth' i]",
+      ].join(","))]
+        .slice(0, 120)
+        .map((node) => `${node.innerText || node.textContent || ""}\n${node.getAttribute("aria-label") || ""}`)
+        .join("\n");
+      const verificationNodes = [...document.querySelectorAll([
+        "[id*='captcha' i]",
+        "[class*='captcha' i]",
+        "[id*='cloudflare' i]",
+        "[class*='cloudflare' i]",
+        "[id*='turnstile' i]",
+        "[class*='turnstile' i]",
+        "[data-testid*='verification' i]",
+        "[data-testid*='captcha' i]",
+        "iframe[src*='captcha' i]",
+        "iframe[src*='cloudflare' i]",
+        "iframe[src*='turnstile' i]",
+      ].join(","))];
+      const alertText = [...document.querySelectorAll("[role='alert'], [data-testid*='error' i], [class*='error' i]")]
+        .slice(0, 60)
+        .map((node) => node.innerText || node.textContent || "")
+        .join("\n");
+      const hasLoginForm = /(log in|sign up|continue with google|登录|注册|继续使用 google)/i.test(controlText);
+      const hasHumanVerificationControl = verificationNodes.length > 0 ||
+        /(captcha|verify you are human|cloudflare|验证你是真人|人机验证)/i.test(controlText);
+      const hasHumanVerificationBody = /(captcha|verify you are human|cloudflare|验证你是真人|人机验证)/i.test(bodyText);
+      const hasPageErrorControl = /(something went wrong|network error|try again later|出了点问题|网络错误)/i.test(alertText || controlText);
+      return {
+        bodyText,
+        articleCount: articles.length,
+        hasAssistantArticle,
+        hasComposer,
+        hasConversationStructure,
+        hasLoginForm,
+        hasHumanVerificationControl,
+        hasHumanVerificationBody,
+        hasPageErrorControl,
+      };
+    }, undefined, { timeoutMs: 1500 })
+    .catch(() => ({
+      bodyText: knownText,
+      articleCount: 0,
+      hasAssistantArticle: false,
+      hasComposer: false,
+      hasConversationStructure: false,
+      hasLoginForm: false,
+      hasHumanVerificationControl: false,
+      hasHumanVerificationBody: false,
+      hasPageErrorControl: false,
+    }));
+  return normalizeChatGptSurface(raw, currentUrl, knownText);
+}
+
+function pageStateFromChatGptSurface(surface) {
+  if (surface.hasHumanVerificationControl) return "human_verification_required";
+  if (surface.hasConversationSurface) return "ok";
+  if (surface.hasLoginForm) return "login_required";
+  if (surface.hasHumanVerificationBody) return "human_verification_required";
+  if (surface.hasPageErrorControl || surface.hasPageErrorBody) return "page_error";
+  return surface.fallbackTextState || "ok";
+}
+
+async function probeChatGptPageState(tab, knownText = "") {
+  const surface = await probeChatGptSurface(tab, knownText);
+  const status = pageStateFromChatGptSurface(surface);
+  return { ...surface, ok: status === "ok", status };
+}
+
 function looksLikeMissingConversation(text) {
   return /(conversation (was )?not found|unable to load conversation|not found|找不到.*(聊天|对话)|无法加载.*(聊天|对话)|该(聊天|对话).*不存在|此(聊天|对话).*已删除)/i.test(
     String(text || ""),
@@ -380,11 +557,11 @@ async function goChatGpt(tab) {
   await tab.goto(CHATGPT_URL);
   await waitForLoad(tab);
   const text = await visibleText(tab);
-  const state = classifyChatGptPage(text);
-  if (state !== "ok") {
-    return { ok: false, status: state, text };
+  const pageState = await probeChatGptPageState(tab, text);
+  if (pageState.status !== "ok") {
+    return { ok: false, status: pageState.status, text: pageState.text || text };
   }
-  return { ok: true, status: "ok", text };
+  return { ok: true, status: "ok", text: pageState.text || text };
 }
 
 async function openProjectForStatus(tab, status) {
@@ -440,8 +617,8 @@ async function ensureProject(tab, projectName = DEFAULT_PROJECT_NAME, projectUrl
     await tab.goto(projectUrl);
     await waitForLoad(tab, 20000);
     const text = await visibleText(tab);
-    const state = classifyChatGptPage(text);
-    if (state !== "ok") return { ok: false, status: state, detail: text.slice(0, 2000) };
+    const pageState = await probeChatGptPageState(tab, text);
+    if (pageState.status !== "ok") return { ok: false, status: pageState.status, detail: (pageState.text || text).slice(0, 2000) };
     const currentUrl = await tab.url();
     if (String(currentUrl || "").includes("/project")) {
       return { ok: true, status: "project_selected_by_url", href: currentUrl };
@@ -550,42 +727,19 @@ async function createProject(tab, projectName = DEFAULT_PROJECT_NAME) {
 }
 
 async function ensureMode(tab, modeLabel = DEFAULT_MODE_LABEL, timeoutMs = 20000) {
-  const labels = [modeLabel];
-  if (modeLabel === DEFAULT_MODE_LABEL && !labels.includes("深入")) labels.push("深入");
+  if (modeLabel === "USER_CONFIRMED") {
+    return { ok: true, status: "mode_user_confirmed" };
+  }
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-  const body = await visibleText(tab);
-  if (labels.some((label) => body.includes(label))) return { ok: true, status: "mode_present" };
-  const possibleButtons = [
-    tab.playwright.getByRole("button", { name: /.+/ }),
-    tab.playwright.locator("button"),
-  ];
-  for (const buttons of possibleButtons) {
-    const count = await buttons.count();
-    for (let i = 0; i < Math.min(count, 30); i += 1) {
-      const button = buttons.nth(i);
-      try {
-        const text = await button.innerText({ timeoutMs: 500 });
-        if (!text || !/(模式|mode|thinking|专业|深入|fast|auto|自动)/i.test(text)) continue;
-        await button.click({ timeoutMs: 2000 });
-        await sleep(700);
-        for (const label of labels) {
-          if (await clickVisibleText(tab, label, { exact: false, timeoutMs: 4000 })) {
-            await sleep(500);
-            return { ok: true, status: "mode_selected" };
-          }
-        }
-      } catch {
-        // Try next button.
-      }
-    }
-  }
+    const body = await visibleText(tab);
+    if (body.includes(modeLabel)) return { ok: true, status: "mode_present" };
     await sleep(1000);
   }
   return {
     ok: false,
-    status: "mode_unavailable",
-    detail: `Required ChatGPT mode label "${modeLabel}" was not visible/selectable.`,
+    status: "mode_confirmation_required",
+    detail: `Required ChatGPT mode label "${modeLabel}" was not visible. Stop and ask the user to confirm the mode before upload/submit.`,
   };
 }
 
@@ -634,6 +788,15 @@ async function clickUploadControl(tab, zipPath) {
   const inputs = tab.playwright.locator('input[type="file"]');
   const inputCount = await inputs.count();
   if (inputCount > 0) {
+    try {
+      await inputs.nth(inputCount - 1).setInputFiles([zipPath], { timeoutMs: 12000 });
+      const chip = await waitForUploadChip(tab, zipPath, 45000);
+      if (chip) return "input-file:setInputFiles-direct+upload-chip";
+      return "input-file:setInputFiles-direct-no-chip";
+    } catch (error) {
+      noteUploadError(error);
+      // Fall through to chooser-based upload.
+    }
     const chooserPromise = tab.playwright.waitForEvent("filechooser", { timeoutMs: 12000 });
     try {
       await inputs.nth(inputCount - 1).click({ timeoutMs: 5000, force: true });
@@ -731,8 +894,8 @@ async function waitForUploadConfirmation(tab, zipPath, timeoutMs = 180000) {
     await sleep(2000);
     const text = await visibleText(tab);
     lastText = text;
-    const state = classifyChatGptPage(text);
-    if (state !== "ok") return { ok: false, status: state, text };
+    const pageState = await probeChatGptPageState(tab, text);
+    if (pageState.status !== "ok") return { ok: false, status: pageState.status, text: pageState.text || text };
     const uploadState = uploadStateFromText(text, baseName);
     if (uploadState === "confirmed") {
       return { ok: true, status: "upload_confirmed", text };
@@ -1015,6 +1178,17 @@ function conversationIdFromUrl(url) {
   return match ? match[1] : "";
 }
 
+function sameConversationUrl(a, b) {
+  const aId = conversationIdFromUrl(a);
+  const bId = conversationIdFromUrl(b);
+  return Boolean(aId && bId && aId === bId);
+}
+
+function tabIdValue(tabOrInfo) {
+  if (!tabOrInfo || tabOrInfo.id == null) return "";
+  return String(tabOrInfo.id);
+}
+
 function titleSearchNeedles(status) {
   return [
     status.conversation_title,
@@ -1077,6 +1251,32 @@ function uploadRecoveryStates() {
   return new Set(["uploading", "upload_failed", "upload_confirmed", "submit_failed", "submit_button_unavailable", "submit_pending_conversation_url"]);
 }
 
+function recordedConversationUrlForStatus(status = {}) {
+  const projectUrl = String(status.project_url || "");
+  const raw = [status.conversation_url, status.actual_conversation_url, status.expected_conversation_url]
+    .map((item) => String(item || ""))
+    .find((item) => isConversationUrl(item)) || "";
+  if (!raw) return "";
+  if (projectUrl && !isProjectConversationUrl(raw, projectUrl)) return "";
+  return raw;
+}
+
+function shouldStrictResumeRecordedRun(status = {}) {
+  if (!recordedConversationUrlForStatus(status)) return false;
+  if (status.submit_confirmed === true) return true;
+  if (isConversationUrl(status.actual_conversation_url)) return true;
+  const state = String(status.state || "");
+  return new Set([
+    "submitted",
+    "generating",
+    "timeout",
+    "tab_lost",
+    "manual_copy_required",
+    "extract_failed",
+    "resume_tab_missing",
+  ]).has(state);
+}
+
 async function latestConversationUrlForRun(runDir, fallback = "") {
   const status = await readJson(path.join(runDir, "status.json")).catch(() => ({}));
   if (isConversationUrl(status.conversation_url)) return String(status.conversation_url);
@@ -1118,8 +1318,8 @@ async function waitForSubmissionConfirmation(tab, options = {}) {
     if (await stopControlVisible(tab)) return { ok: true, status: "generating", url: lastUrl };
     const text = await visibleText(tab);
     lastText = text;
-    const pageState = classifyChatGptPage(text);
-    if (pageState !== "ok") return { ok: false, status: pageState, url: lastUrl, text };
+    const pageState = await probeChatGptPageState(tab, text);
+    if (pageState.status !== "ok") return { ok: false, status: pageState.status, url: lastUrl, text: pageState.text || text };
     if (submissionStateFromText(text, uploadBaseName) === "generating") {
       return { ok: true, status: "generating", url: lastUrl };
     }
@@ -1249,11 +1449,13 @@ async function waitForCompletion(tab, runDir, timeoutMs = WATCH_TIMEOUT_MS) {
       }
       throw error;
     }
-    const pageState = classifyChatGptPage(text);
-    if (pageState !== "ok") return { ok: false, status: pageState, phase, response: "" };
+    const response = await extractAssistantResponse(tab);
+    const pageState = await probeChatGptPageState(tab, text);
+    if (pageState.status !== "ok" && !response) {
+      return { ok: false, status: pageState.status, phase, response: "" };
+    }
     const stopVisible = await stopControlVisible(tab);
     const thinkingState = await probeThinkingState(tab);
-    const response = await extractAssistantResponse(tab);
     const hasResponse = response.length > 200;
     if (stopVisible) phase = "generating";
     else if (hasResponse && phase !== "waiting_for_start") phase = "stabilizing";
@@ -1353,6 +1555,27 @@ async function closeStrayProjectTabs(browser, status = {}) {
   return closed;
 }
 
+async function closeDuplicateConversationTabs(browser, status = {}, keepTab = null) {
+  const conversationUrl = String(status.conversation_url || "");
+  if (!isConversationUrl(conversationUrl)) return 0;
+  const keepId = keepTab?.id == null ? "" : String(keepTab.id);
+  let closed = 0;
+  const openTabs = await browser.user.openTabs().catch(() => []);
+  for (const info of openTabs) {
+    const url = String(info.url || "");
+    if (!sameConversationUrl(url, conversationUrl)) continue;
+    if (keepId && String(info.id || "") === keepId) continue;
+    try {
+      const tab = await browser.user.claimTab(info);
+      if (keepId && String(tab.id || "") === keepId) continue;
+      if (await closeTabQuietly(tab)) closed += 1;
+    } catch {
+      // Ignore tabs that disappeared between list and claim.
+    }
+  }
+  return closed;
+}
+
 async function closeTabQuietly(tab) {
   try {
     await tab.close();
@@ -1360,6 +1583,33 @@ async function closeTabQuietly(tab) {
   } catch {
     return false;
   }
+}
+
+async function completeRunWithResponse(runDir, tab, status, response, patch = {}) {
+  await fs.writeFile(path.join(runDir, "response.md"), response + "\n");
+  if (tab) await saveConversation(runDir, tab, status.conversation_title || "");
+  await writeStatus(runDir, {
+    state: patch.state || "completed",
+    error: "",
+    response_chars: response.length,
+    completed_at: new Date().toISOString(),
+    ...patch,
+  });
+  return { status: "success", response };
+}
+
+async function recordExtractionFailure(runDir, tab, kind, response = "", message = "", patch = {}) {
+  if (response) await fs.writeFile(path.join(runDir, "response.partial.md"), response + "\n");
+  await writeStatus(runDir, {
+    state: kind,
+    error: message,
+    response_chars: response.length,
+    ...patch,
+  });
+  return {
+    status: kind,
+    keepTabs: tab ? [keepEntryForStatus(tab, kind)].filter(Boolean) : [],
+  };
 }
 
 async function deleteLocalZipIfUploaded(runDir, zipPath) {
@@ -1442,6 +1692,7 @@ async function submitPromptAndMaybeWatch(tab, runDir, status, options = {}) {
   const conversationReused = Boolean(expectedUrl && finalConversationUrl === expectedUrl);
   const conversationForked = Boolean(expectedUrl && finalConversationUrl && finalConversationUrl !== expectedUrl);
   await writeStatus(runDir, {
+    ...submittedStatePatch(submitted),
     submit_confirmed: true,
     submit_confirmation: submitted.status,
     submit_attempts: submitted.attempt || 1,
@@ -1450,6 +1701,8 @@ async function submitPromptAndMaybeWatch(tab, runDir, status, options = {}) {
     conversation_forked_after_submit: conversationForked,
     expected_conversation_url: expectedUrl,
     actual_conversation_url: finalConversationUrl,
+    active_tab_id: tabIdValue(tab),
+    submitted_tab_id: tabIdValue(tab),
   });
   await deleteLocalZipIfUploaded(runDir, status.upload_bundle);
   if (shouldAutoRename(status, options)) {
@@ -1477,23 +1730,22 @@ async function submitPromptAndMaybeWatch(tab, runDir, status, options = {}) {
   if (!result.ok) {
     if (result.response) await fs.writeFile(path.join(runDir, "response.partial.md"), result.response + "\n");
     keepTabs.push(keepEntryForStatus(tab, result.status));
-    await writeStatus(runDir, { state: result.status, watch_phase: result.phase });
+    await writeStatus(runDir, { state: result.status, watch_phase: result.phase, active_tab_id: tabIdValue(tab) });
     return { status: result.status, keepTabs };
   }
   if (!responseMatchesRun(result.response, status)) {
-    keepTabs.push(keepEntryForStatus(tab, "extract_failed"));
-    await writeStatus(runDir, {
-      state: "extract_failed",
-      error: "Extracted response did not match this run topic/run id.",
-      response_chars: result.response.length,
-    });
-    return { status: "extract_failed", keepTabs };
+    const failure = await recordExtractionFailure(
+      runDir,
+      tab,
+      "extract_failed",
+      result.response,
+      "Extracted response did not match this run topic/run id.",
+    );
+    return { status: "extract_failed", keepTabs: failure.keepTabs };
   }
-  await fs.writeFile(path.join(runDir, "response.md"), result.response + "\n");
-  await saveConversation(runDir, tab, status.conversation_title || "");
+  await completeRunWithResponse(runDir, tab, status, result.response);
   const renameStatus = await readJson(path.join(runDir, "status.json"));
   await renameConversationIfPossible(tab, runDir, renameStatus, options);
-  await writeStatus(runDir, { state: "completed", error: "", completed_at: new Date().toISOString() });
   if (shouldKeepOpen(status, options)) keepTabs.push(keepEntryForStatus(tab, "kept_open"));
   return { status: "success", keepTabs };
 }
@@ -1877,14 +2129,11 @@ async function saveConversation(runDir, tab, titleOverride = "") {
 async function runOne(browser, runDir, options = {}) {
   runDir = path.resolve(runDir);
   const status = await readJson(path.join(runDir, "status.json"));
+  await nameSessionForStatus(browser, status);
   const canReuseExisting = status.conversation_policy === "reuse_existing" || status.reuse_existing === true;
-  const rawExistingConversationUrl = canReuseExisting && isConversationUrl(status.conversation_url) ? String(status.conversation_url) : "";
-  const existingConversationUrl = rawExistingConversationUrl &&
-    (!status.project_url || isProjectConversationUrl(rawExistingConversationUrl, status.project_url))
-    ? rawExistingConversationUrl
-    : "";
-  let tab = existingConversationUrl ? await claimMatchingRunTab(browser, status).catch(() => null) : null;
-  if (!tab) tab = await browser.tabs.new();
+  const strictResumeRecordedRun = shouldStrictResumeRecordedRun(status);
+  const rawExistingConversationUrl = (canReuseExisting || strictResumeRecordedRun) ? recordedConversationUrlForStatus(status) : "";
+  const existingConversationUrl = rawExistingConversationUrl;
   const keepTabs = [];
   const answer = {
     runDir,
@@ -1893,8 +2142,62 @@ async function runOne(browser, runDir, options = {}) {
     conversation_url: "",
     kept: false,
   };
+  let tab = existingConversationUrl ? await claimMatchingRunTab(browser, status).catch(() => null) : null;
+  if (!tab && existingConversationUrl) {
+    answer.status = "resume_tab_missing";
+    answer.conversation_url = existingConversationUrl;
+    await writeStatus(runDir, {
+      state: "resume_tab_missing",
+      expected_conversation_url: existingConversationUrl,
+      error: "Existing ChatGPT conversation URL was recorded, but no matching open tab was found. Reopen or adopt the original tab manually; the runner will not open a duplicate conversation tab by default.",
+    });
+    return { answer, keepTabs };
+  }
+  if (tab && strictResumeRecordedRun) {
+    await writeStatus(runDir, { active_tab_id: tabIdValue(tab), resumed: true });
+    const existingResponsePath = path.join(runDir, "response.md");
+    const existingResponse = await fs.readFile(existingResponsePath, "utf8").catch(() => "");
+    if (existingResponse && responseMatchesRun(existingResponse, status)) {
+      await writeStatus(runDir, { state: "completed", error: "", resumed: true, completed_at: new Date().toISOString() });
+      answer.status = "success";
+      answer.conversation_url = await latestConversationUrlForRun(runDir, existingConversationUrl);
+      if (!shouldKeepOpen(status, options)) await closeTabQuietly(tab);
+      else keepTabs.push(keepEntryForStatus(tab, "kept_open"));
+      return { answer, keepTabs };
+    }
+    const result = await waitForCompletion(tab, runDir, effectiveWatchTimeout(options));
+    if (!result.ok) {
+      await fs.writeFile(path.join(runDir, "response.partial.md"), (result.response || "") + "\n");
+      await writeStatus(runDir, { state: result.status, resumed: true });
+      answer.status = result.status;
+      answer.conversation_url = await latestConversationUrlForRun(runDir, existingConversationUrl);
+      keepTabs.push(keepEntryForStatus(tab, result.status));
+      return { answer, keepTabs };
+    }
+    if (!responseMatchesRun(result.response, status)) {
+      const failure = await recordExtractionFailure(
+        runDir,
+        tab,
+        "extract_failed",
+        result.response,
+        "Extracted response did not match this run topic/run id.",
+        { resumed: true },
+      );
+      answer.status = "extract_failed";
+      answer.conversation_url = await latestConversationUrlForRun(runDir, existingConversationUrl);
+      keepTabs.push(...failure.keepTabs);
+      return { answer, keepTabs };
+    }
+    await completeRunWithResponse(runDir, tab, status, result.response, { resumed: true, extracted_existing_tab: true });
+    answer.status = "success";
+    answer.conversation_url = await latestConversationUrlForRun(runDir, existingConversationUrl);
+    if (!shouldKeepOpen(status, options)) await closeTabQuietly(tab);
+    else keepTabs.push(keepEntryForStatus(tab, "kept_open"));
+    return { answer, keepTabs };
+  }
+  if (!tab) tab = await newRunTab(browser, status);
   try {
-    await writeStatus(runDir, { state: "opening_chrome_tab" });
+    await writeStatus(runDir, { state: "opening_chrome_tab", active_tab_id: tabIdValue(tab) });
     if (rawExistingConversationUrl && !existingConversationUrl) {
       await writeStatus(runDir, {
         state: "conversation_project_stale",
@@ -1921,19 +2224,19 @@ async function runOne(browser, runDir, options = {}) {
         });
       } else {
       const text = await visibleText(tab);
-      const pageState = classifyChatGptPage(text);
-      if (pageState !== "ok") {
-        if (pageState === "login_required" || pageState === "human_verification_required") {
-          answer.status = pageState;
+      const pageState = await probeChatGptPageState(tab, text);
+      if (pageState.status !== "ok") {
+        if (pageState.status === "login_required" || pageState.status === "human_verification_required") {
+          answer.status = pageState.status;
           keepTabs.push(keepEntryForStatus(tab, answer.status));
-          await writeStatus(runDir, { state: answer.status, error: text?.slice(0, 2000) || "" });
+          await writeStatus(runDir, { state: answer.status, error: (pageState.text || text)?.slice(0, 2000) || "" });
           return { answer, keepTabs };
         }
         await writeStatus(runDir, {
           state: "conversation_url_rejected",
           stale_conversation_url: existingConversationUrl,
           conversation_url: "",
-          error: text?.slice(0, 2000) || pageState,
+          error: (pageState.text || text)?.slice(0, 2000) || pageState.status,
         });
       } else if (looksLikeMissingConversation(text)) {
         await writeStatus(runDir, {
@@ -2106,7 +2409,10 @@ export async function resumeGptProReview(options) {
   const releaseSlot = await acquireChromeOperationSlot({ slots: options.chromeOperationSlots || DEFAULT_CHROME_OPERATION_SLOTS });
   try {
   const browser = await setupChrome();
-  const rawStatusConversationUrl = isConversationUrl(status.conversation_url) ? String(status.conversation_url) : "";
+  await nameSessionForStatus(browser, status);
+  const rawStatusConversationUrl = [status.conversation_url, status.actual_conversation_url, status.expected_conversation_url]
+    .map((item) => String(item || ""))
+    .find((item) => isConversationUrl(item)) || "";
   const statusConversationUrl = rawStatusConversationUrl &&
     (!status.project_url || isProjectConversationUrl(rawStatusConversationUrl, status.project_url))
     ? rawStatusConversationUrl
@@ -2134,14 +2440,29 @@ export async function resumeGptProReview(options) {
     });
   }
   let tab = await claimMatchingRunTab(browser, statusForClaim);
+  if (tab && statusConversationUrl) {
+    const closedDuplicates = await closeDuplicateConversationTabs(browser, statusForClaim, tab).catch(() => 0);
+    await writeStatus(runDir, { active_tab_id: tabIdValue(tab), duplicate_conversation_tabs_closed: closedDuplicates, resumed: true });
+  }
   if (!tab && statusConversationUrl) {
-    tab = await browser.tabs.new();
-    await tab.goto(statusConversationUrl);
-    await waitForLoad(tab, 20000);
+    await writeStatus(runDir, {
+      state: "resume_tab_missing",
+      resumed: true,
+      expected_conversation_url: statusConversationUrl,
+      error: "Recorded ChatGPT conversation URL was not found among open tabs. The runner will not open a duplicate tab by default.",
+    });
+    await finalizeBrowserTabs(browser, []);
+    return {
+      runDir,
+      status: "resume_tab_missing",
+      keptTabs: 0,
+      conversation_url: statusConversationUrl,
+    };
   }
   let openedFreshUploadRetry = false;
   if (!tab && status.upload_bundle && uploadRecoveryStates().has(String(status.state || ""))) {
-    tab = await browser.tabs.new();
+    tab = await newRunTab(browser, status);
+    await writeStatus(runDir, { active_tab_id: tabIdValue(tab), resumed: true });
     const { startup, project } = await openProjectForStatus(tab, status);
     if (!startup.ok) {
       await writeStatus(runDir, { state: startup.status, error: startup.text?.slice(0, 2000) || "", resumed: true });
@@ -2166,7 +2487,18 @@ export async function resumeGptProReview(options) {
     await writeStatus(runDir, { state: "upload_retry_new_tab", resumed: true, error: "" });
   }
   if (!tab) {
-    throw new Error("No resumable ChatGPT tab was found through Chrome runtime. Open the saved conversation URL and retry.");
+    await writeStatus(runDir, {
+      state: "chrome_handoff_required",
+      resumed: true,
+      error: "Chrome runtime could not find a resumable ChatGPT tab. Do not use Computer Use automatically; reopen the saved conversation URL or retry Chrome resume.",
+    });
+    await finalizeBrowserTabs(browser, []);
+    return {
+      runDir,
+      status: "chrome_handoff_required",
+      keptTabs: 0,
+      conversation_url: await latestConversationUrlForRun(runDir),
+    };
   }
 
   if (status.upload_bundle && uploadRecoveryStates().has(String(status.state || ""))) {
@@ -2193,20 +2525,20 @@ export async function resumeGptProReview(options) {
     return { runDir, status: result.status, keptTabs: 1, conversation_url: await latestConversationUrlForRun(runDir) };
   }
   if (!responseMatchesRun(result.response, status)) {
-    await fs.writeFile(path.join(runDir, "response.partial.md"), result.response + "\n");
-    await writeStatus(runDir, {
-      state: "extract_failed",
-      error: "Extracted response did not match this run topic/run id.",
-      resumed: true,
-    });
-    await finalizeBrowserTabs(browser, [keepEntryForStatus(tab, "extract_failed")]);
-    return { runDir, status: "extract_failed", keptTabs: 1, conversation_url: await latestConversationUrlForRun(runDir) };
+    const failure = await recordExtractionFailure(
+      runDir,
+      tab,
+      "extract_failed",
+      result.response,
+      "Extracted response did not match this run topic/run id.",
+      { resumed: true },
+    );
+    const kept = await finalizeBrowserTabs(browser, failure.keepTabs);
+    return { runDir, status: "extract_failed", keptTabs: kept, conversation_url: await latestConversationUrlForRun(runDir) };
   }
-  await fs.writeFile(path.join(runDir, "response.md"), result.response + "\n");
-  await saveConversation(runDir, tab, status.conversation_title || "");
+  await completeRunWithResponse(runDir, tab, status, result.response, { resumed: true });
   const renameStatus = await readJson(path.join(runDir, "status.json"));
   await renameConversationIfPossible(tab, runDir, renameStatus, options);
-  await writeStatus(runDir, { state: "completed", error: "", resumed: true, completed_at: new Date().toISOString() });
   const keepTabs = shouldKeepOpen(status, options) ? [keepEntryForStatus(tab, "kept_open")] : [];
   if (!shouldKeepOpen(status, options)) await closeTabQuietly(tab);
   const kept = await finalizeBrowserTabs(browser, keepTabs);
@@ -2223,7 +2555,51 @@ async function claimMatchingRunTab(browser, status) {
   const topic = String(status.topic || "");
   const titleNeedle = String(status.conversation_title || "");
   const conversationUrl = String(status.conversation_url || "");
+  const activeTabId = String(status.active_tab_id || status.submitted_tab_id || "");
   const needles = titleSearchNeedles(status);
+  if (isConversationUrl(conversationUrl)) {
+    const strictCandidates = openTabs
+      .filter((tab) => String(tab.url || "").includes("chatgpt.com") && !isChatGptFileContentUrl(tab.url || ""))
+      .filter((tab) => sameConversationUrl(String(tab.url || ""), conversationUrl))
+      .map((tab) => ({
+        tab,
+        score:
+          (activeTabId && String(tab.id || "") === activeTabId ? 500 : 0) +
+          (String(tab.tabGroup || "").includes("GPT Pro review") ? 50 : 0) +
+          (String(tab.url || "") === conversationUrl ? 10 : 0),
+      }))
+      .sort((a, b) => b.score - a.score);
+    if (!strictCandidates.length) {
+      const activeInfo = activeTabId ? openTabs.find((tab) => String(tab.id || "") === activeTabId) : null;
+      if (activeInfo && String(activeInfo.url || "").includes("chatgpt.com") && !isChatGptFileContentUrl(activeInfo.url || "")) {
+        try {
+          const claimed = await browser.user.claimTab(activeInfo);
+          const claimedUrl = String((await claimed.url()) || "");
+          if (sameConversationUrl(claimedUrl, conversationUrl)) return claimed;
+        } catch {
+          // Fall through to strict miss.
+        }
+      }
+      return null;
+    }
+    const claimed = await browser.user.claimTab(strictCandidates[0].tab);
+    await closeDuplicateConversationTabs(browser, status, claimed).catch(() => 0);
+    return claimed;
+  }
+  if (activeTabId) {
+    const activeInfo = openTabs.find((tab) => String(tab.id || "") === activeTabId);
+    if (activeInfo && String(activeInfo.url || "").includes("chatgpt.com") && !isChatGptFileContentUrl(activeInfo.url || "")) {
+      try {
+        const claimed = await browser.user.claimTab(activeInfo);
+        const claimedUrl = String((await claimed.url()) || "");
+        if (!conversationUrl || sameConversationUrl(claimedUrl, conversationUrl) || !isConversationUrl(conversationUrl)) {
+          return claimed;
+        }
+      } catch {
+        // Fall through to URL/content matching.
+      }
+    }
+  }
   const candidates = openTabs
     .filter((tab) => String(tab.url || "").includes("chatgpt.com") && !isChatGptFileContentUrl(tab.url || ""))
     .map((tab) => {
@@ -2231,7 +2607,9 @@ async function claimMatchingRunTab(browser, status) {
       const title = String(tab.title || "");
       let score = 1;
       if (String(tab.tabGroup || "").includes("GPT Pro review")) score += 50;
-      if (conversationUrl && conversationUrl.includes("/c/") && url === conversationUrl) score += 200;
+      if (activeTabId && String(tab.id || "") === activeTabId) score += 500;
+      if (conversationUrl && conversationUrl.includes("/c/") && sameConversationUrl(url, conversationUrl)) score += 350;
+      if (conversationUrl && conversationUrl.includes("/c/") && url === conversationUrl) score += 50;
       if (titleNeedle && title.includes(titleNeedle)) score += 100;
       if (topic && title.includes(topic)) score += 60;
       if (needles.some((needle) => title.includes(needle))) score += 30;
@@ -2244,7 +2622,10 @@ async function claimMatchingRunTab(browser, status) {
     const claimed = await browser.user.claimTab(info);
     const url = String((await claimed.url()) || "");
     const title = String((await claimed.title()) || "");
-    if (conversationUrl && conversationUrl.includes("/c/") && url === conversationUrl) return claimed;
+    if (conversationUrl && conversationUrl.includes("/c/") && sameConversationUrl(url, conversationUrl)) {
+      await closeDuplicateConversationTabs(browser, status, claimed).catch(() => 0);
+      return claimed;
+    }
     const text = await visibleText(claimed).catch(() => "");
     if (
       (runId && text.includes(runId)) ||
@@ -2252,11 +2633,89 @@ async function claimMatchingRunTab(browser, status) {
       (titleNeedle && title.includes(titleNeedle)) ||
       needles.some((needle) => title.includes(needle) || text.includes(needle))
     ) {
+      await closeDuplicateConversationTabs(browser, { ...status, conversation_url: conversationUrl || url }, claimed).catch(() => 0);
       return claimed;
     }
     if (!fallback) fallback = claimed;
   }
   return candidates.length === 1 ? fallback : null;
+}
+
+export async function extractExistingGptResponse(options = {}) {
+  const runDir = path.resolve(options.runDir);
+  const status = await readJson(path.join(runDir, "status.json"));
+  const release = await acquireRunLock(status);
+  const releaseSlot = await acquireChromeOperationSlot({ slots: options.chromeOperationSlots || DEFAULT_CHROME_OPERATION_SLOTS });
+  let browser = options.browser || null;
+  try {
+    if (!browser) browser = await setupChrome();
+    await nameSessionForStatus(browser, status);
+    const rawConversationUrl = [status.conversation_url, status.actual_conversation_url, status.expected_conversation_url]
+      .map((item) => String(item || ""))
+      .find((item) => isConversationUrl(item)) || "";
+    const conversationUrl = rawConversationUrl &&
+      (!status.project_url || isProjectConversationUrl(rawConversationUrl, status.project_url))
+      ? rawConversationUrl
+      : "";
+    if (!conversationUrl) {
+      await writeStatus(runDir, {
+        state: "manual_copy_required",
+        resumed: true,
+        error: "No valid recorded ChatGPT conversation URL is available for read-only extraction.",
+      });
+      await finalizeBrowserTabs(browser, []);
+      return { runDir, status: "manual_copy_required", keptTabs: 0, conversation_url: "" };
+    }
+    const tab = await claimMatchingRunTab(browser, { ...status, conversation_url: conversationUrl });
+    if (!tab) {
+      await writeStatus(runDir, {
+        state: "resume_tab_missing",
+        resumed: true,
+        expected_conversation_url: conversationUrl,
+        error: "Recorded ChatGPT conversation URL was not found among open tabs. The extractor will not open a duplicate tab.",
+      });
+      await finalizeBrowserTabs(browser, []);
+      return { runDir, status: "resume_tab_missing", keptTabs: 0, conversation_url: conversationUrl };
+    }
+    await writeStatus(runDir, { active_tab_id: tabIdValue(tab), resumed: true, read_only_extract: true });
+    const response = await extractAssistantResponse(tab);
+    if (!response) {
+      const failure = await recordExtractionFailure(
+        runDir,
+        tab,
+        "manual_copy_required",
+        "",
+        "Chrome runtime claimed the original tab, but no final GPT Pro review response was extractable. Use gpt-review --import-response RUN_DIR --from-file PATH.",
+        { resumed: true, read_only_extract: true },
+      );
+      const kept = await finalizeBrowserTabs(browser, failure.keepTabs);
+      return { runDir, status: "manual_copy_required", keptTabs: kept, conversation_url: conversationUrl };
+    }
+    if (!responseMatchesRun(response, status)) {
+      const failure = await recordExtractionFailure(
+        runDir,
+        tab,
+        "extract_failed",
+        response,
+        "Extracted response did not match this run topic/run id. Use gpt-review --import-response only after checking the visible final answer.",
+        { resumed: true, read_only_extract: true },
+      );
+      const kept = await finalizeBrowserTabs(browser, failure.keepTabs);
+      return { runDir, status: "extract_failed", keptTabs: kept, conversation_url: conversationUrl };
+    }
+    await completeRunWithResponse(runDir, tab, status, response, {
+      resumed: true,
+      read_only_extract: true,
+      extracted_existing_tab: true,
+    });
+    const keepOpen = options.keepOpen !== false;
+    if (!keepOpen) await closeTabQuietly(tab);
+    const kept = await finalizeBrowserTabs(browser, keepOpen ? [keepEntryForStatus(tab, "kept_open")] : []);
+    return { runDir, status: "success", keptTabs: kept, conversation_url: conversationUrl };
+  } finally {
+    await releaseSlot();
+    await release();
+  }
 }
 
 export async function doctorChrome() {
@@ -2267,7 +2726,7 @@ export async function doctorChrome() {
     await tab.goto(CHATGPT_URL);
     await waitForLoad(tab);
     const text = await visibleText(tab);
-    const pageState = classifyChatGptPage(text);
+    const pageState = (await probeChatGptPageState(tab, text)).status;
     return {
       ok: pageState === "ok",
       browser: "extension",
@@ -2304,13 +2763,21 @@ export const __testing = {
   sanitizeText,
   redactValue,
   classifyChatGptPage,
+  probeChatGptSurface,
+  probeChatGptPageState,
   isConversationUrl,
+  conversationIdFromUrl,
+  sameConversationUrl,
   projectSlugFromProjectUrl,
   isProjectConversationUrl,
   shouldKeepOpen,
   shouldAutoRename,
   shouldAllowEnterSubmit,
+  runSessionNameForStatus,
+  submittedStatePatch,
   expectedConversationUrl,
+  recordedConversationUrlForStatus,
+  shouldStrictResumeRecordedRun,
   titleSearchNeedles,
   uploadRecoveryStates,
   latestConversationUrlForRun,
@@ -2337,9 +2804,14 @@ export const __testing = {
   acquireChromeOperationSlot,
   finalizeKeepEntries,
   finalizeBrowserTabs,
+  completeRunWithResponse,
+  recordExtractionFailure,
   closeStrayProjectTabs,
+  closeDuplicateConversationTabs,
+  claimMatchingRunTab,
   closeTabQuietly,
   keepEntryForStatus,
+  runOne,
   runPool,
   defaultConcurrency: DEFAULT_CONCURRENCY,
   maxConcurrency: MAX_CONCURRENCY,

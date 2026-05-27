@@ -33,6 +33,7 @@ RUN_DIR = STATE_ROOT / "runs"
 REGISTRY_DIR = STATE_ROOT / "registry"
 LOCK_DIR = STATE_ROOT / "locks"
 CONFIG_PATH = STATE_ROOT / "config.json"
+ISSUE_LOG_PATH = STATE_ROOT / "plugin_issue_log.jsonl"
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 CHROME_PLUGIN_ROOT = Path.home() / ".codex" / "plugins" / "cache" / "openai-bundled" / "chrome"
 MARKETPLACE_PATH = Path.home() / ".agents" / "plugins" / "marketplace.json"
@@ -53,9 +54,6 @@ PLUGIN_CACHE_SKILL_DIR = (
 DEFAULT_CHATGPT_PROJECT = "your ChatGPT Project"
 DEFAULT_CHATGPT_PROJECT_KEY = "default_project"
 DEFAULT_CHATGPT_PROJECT_URL = "https://chatgpt.com/g/g-p-your-project/project"
-EXAMPLE_CHATGPT_PROJECT = "example project"
-EXAMPLE_CHATGPT_PROJECT_KEY = "example_project"
-EXAMPLE_CHATGPT_PROJECT_URL = "https://chatgpt.com/g/g-p-example-project/project"
 EXAMPLE_PROJECT_PREFIX = Path("~/projects/example_project")
 DEFAULT_MODE_LABEL = "进阶专业"
 DEFAULT_TOPIC = "default"
@@ -68,17 +66,21 @@ DEFAULT_MAX_FILE_BYTES = 3 * 1024 * 1024
 DEFAULT_MAX_BUNDLE_BYTES = 80 * 1024 * 1024
 
 EXAMPLE_WORKSTREAM_TOPICS = {
-    "analysis": "example_analysis",
-    "figures": "example_figures",
-    "experiments": "example_experiments",
-    "literature": "example_literature",
+    "eit": "example_eit",
+    "other_experiment": "example_other_experiment",
+    "flow_cytometry": "example_flow_cytometry",
+    "transcriptome": "example_transcriptome",
+    "single_cell": "example_single_cell",
+    "cross_omics": "example_cross_omics",
 }
 EXAMPLE_WORKSTREAM_TITLES = {
-    "example_analysis": "example analysis review",
-    "example_figures": "example figures review",
-    "example_experiments": "example experiments review",
-    "example_literature": "example literature review",
-    "example_root_policy": "example root policy review",
+    "example_eit": "EIT review",
+    "example_other_experiment": "Fig.1 / other_experiment review",
+    "example_flow_cytometry": "flow cytometry review",
+    "example_transcriptome": "transcriptome review",
+    "example_single_cell": "single-cell review",
+    "example_cross_omics": "cross-omics review",
+    "example_root_policy": "root policy review",
 }
 
 TEXT_SUFFIXES = {
@@ -316,79 +318,52 @@ def normalize_conversation_url(url: str | None) -> str:
     return value
 
 
-def configured_project_routes(config: dict[str, Any]) -> list[dict[str, str]]:
-    routes: list[dict[str, str]] = []
-    raw_routes = config.get("project_routes") or []
-    if isinstance(raw_routes, list):
-        for idx, item in enumerate(raw_routes):
-            if not isinstance(item, dict):
-                continue
-            prefix = str(item.get("path_prefix") or "").strip()
-            project_url = str(item.get("project_url") or "").strip()
-            if not prefix or not project_url:
-                continue
-            routes.append(
-                {
-                    "path_prefix": str(Path(prefix).expanduser().resolve()),
-                    "project_url": normalize_project_url(project_url),
-                    "project_name": str(item.get("project_name") or item.get("name") or f"project_{idx + 1}").strip(),
-                    "project_key": slugify(str(item.get("project_key") or item.get("key") or item.get("project_name") or f"project_{idx + 1}")),
-                    "source": "config",
-                }
-            )
-    return routes
-
-
-def route_matches_path(route: dict[str, str], *paths: Path) -> bool:
-    prefix = Path(route["path_prefix"]).expanduser().resolve()
-    for path in paths:
-        resolved = Path(path).expanduser().resolve()
-        if resolved == prefix or prefix in resolved.parents:
-            return True
-    return False
-
-
 def resolve_chatgpt_project(
     session: dict[str, Any],
     args: argparse.Namespace | SimpleNamespace,
     config: dict[str, Any],
 ) -> dict[str, str]:
+    default_project = str(config.get("default_project_name") or DEFAULT_CHATGPT_PROJECT)
+    default_project_key = str(config.get("default_project_key") or DEFAULT_CHATGPT_PROJECT_KEY)
+    default_project_url = normalize_project_url(str(config.get("default_project_url") or DEFAULT_CHATGPT_PROJECT_URL))
     explicit_url = str(getattr(args, "project_url", "") or "").strip()
     explicit_name = str(getattr(args, "project_name", "") or "").strip()
+    allow_non_codex = bool(getattr(args, "allow_non_codex_project", False))
     if explicit_url:
         project_url = normalize_project_url(explicit_url)
+        if project_url != default_project_url and not allow_non_codex:
+            raise SystemExit(
+                "Non-default ChatGPT Project requested. Default GPT Pro reviews must use the default Project.\n"
+                f"- default Project: {default_project_url}\n"
+                f"- requested Project: {project_url}\n"
+                "Re-run only after user confirmation with --allow-non-codex-project."
+            )
+        if project_url == default_project_url:
+            explicit_name = default_project
+        project_name = explicit_name or (
+            default_project if project_url == default_project_url else "custom project"
+        )
+        project_key_source = explicit_name or (
+            default_project_key
+            if project_url == default_project_url
+            else project_slug_from_project_url(project_url) or "custom_project"
+        )
         return {
-            "chatgpt_project": explicit_name or config.get("default_project_name") or "custom project",
-            "project_key": slugify(explicit_name or project_slug_from_project_url(project_url) or "custom_project"),
+            "chatgpt_project": project_name,
+            "project_key": slugify(project_key_source),
             "project_url": project_url,
             "project_slug": project_slug_from_project_url(project_url),
             "project_route_source": "cli",
         }
 
-    routes = configured_project_routes(config)
-    bundle_root = Path(session["bundle_root"])
-    session_root = Path(session["session_root"])
-    matching = [route for route in routes if route_matches_path(route, bundle_root, session_root)]
-    if matching:
-        matching.sort(key=lambda route: len(route["path_prefix"]), reverse=True)
-        route = matching[0]
-        return {
-            "chatgpt_project": route["project_name"],
-            "project_key": route["project_key"],
-            "project_url": route["project_url"],
-            "project_slug": project_slug_from_project_url(route["project_url"]),
-            "project_route_source": route["source"],
-        }
-
-    default_url = str(config.get("default_project_url") or config.get("chatgpt_project_url") or DEFAULT_CHATGPT_PROJECT_URL)
-    project_url = normalize_project_url(default_url)
-    project_name = str(config.get("default_project_name") or DEFAULT_CHATGPT_PROJECT)
+    project_url = default_project_url
+    project_name = default_project
     return {
         "chatgpt_project": project_name,
-        "project_key": str(config.get("default_project_key") or DEFAULT_CHATGPT_PROJECT_KEY),
+        "project_key": slugify(default_project_key),
         "project_url": project_url,
         "project_slug": project_slug_from_project_url(project_url),
-        "project_route_source": "default",
+        "project_route_source": "fixed_default",
     }
 
 
@@ -471,6 +446,39 @@ def write_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def redact_log_string(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "<redacted-email>", text, flags=re.I)
+    text = re.sub(r"(?i)\b(?:bearer|authorization)\s*[:=]\s*[A-Za-z0-9._\-]{16,}", "authorization=<redacted>", text)
+    text = re.sub(r"(?i)\b(?:api[_-]?key|secret|password|token|cookie|session)\s*[:=]\s*['\"]?[^'\"\s]+", "<redacted-secret>", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_\-]{16,}\b", "<redacted-key>", text)
+    return text[:4000]
+
+
+def redact_log_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if re.search(r"(?i)(token|secret|password|cookie|credential|authorization|api[_-]?key|session_id)", str(key)):
+                out[str(key)] = "<redacted>"
+            else:
+                out[str(key)] = redact_log_value(item)
+        return out
+    if isinstance(value, list):
+        return [redact_log_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_log_string(value)
+    return value
+
+
+def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(json.dumps(redact_log_value(record), ensure_ascii=False, sort_keys=True) + "\n")
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 class FileLock:
     def __init__(self, path: Path, wait: bool = True):
         self.path = path
@@ -500,9 +508,15 @@ def effective_config(args: argparse.Namespace | SimpleNamespace, session: dict[s
         "session_root": infer_session_root(project_root(Path.cwd())),
     }
     project = resolve_chatgpt_project(session_for_route, args, config)
+    mode_label = args.mode_label or config.get("mode_label") or DEFAULT_MODE_LABEL
+    if mode_label != DEFAULT_MODE_LABEL:
+        raise SystemExit(
+            f"Only ChatGPT mode '{DEFAULT_MODE_LABEL}' is allowed by default. "
+            f"Requested mode was '{mode_label}'. Stop and ask the user to confirm before changing mode."
+        )
     return {
         **project,
-        "mode_label": args.mode_label or config.get("mode_label") or DEFAULT_MODE_LABEL,
+        "mode_label": mode_label,
         "default_concurrency": int(config.get("default_concurrency") or DEFAULT_CONCURRENCY),
         "max_concurrency": int(config.get("max_concurrency") or MAX_CONCURRENCY),
     }
@@ -997,6 +1011,62 @@ def finalize_run(path: Path) -> int:
     return 0
 
 
+def looks_like_final_review_response(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value.startswith("GPT Pro web review"):
+        return False
+    if not re.search(r"Review State", value, re.I):
+        return False
+    if re.search(r"Then provide|Required output format|Non-negotiable boundaries|##\s*User request|Mode instructions", value, re.I):
+        return False
+    return bool(re.search(r"Blockers|Important findings|Direct answer|直接回答|重要|阻塞", value, re.I))
+
+
+def response_matches_run_text(response: str, status: dict[str, Any]) -> bool:
+    text = str(response or "")
+    topic = str(status.get("topic") or "")
+    run_id = str(status.get("run_id") or "")
+    if run_id and run_id in text:
+        return True
+    if topic and topic in text:
+        return True
+    return False
+
+
+def import_response_run(selector: str, from_file: Path | str) -> int:
+    run_dir = resolve_run_dir(selector)
+    source = Path(from_file).expanduser().resolve()
+    if not (run_dir / "status.json").exists():
+        print(f"status.json not found: {run_dir}", file=sys.stderr)
+        return 1
+    if not source.exists():
+        print(f"response source not found: {source}", file=sys.stderr)
+        return 1
+    status = load_json(run_dir / "status.json") or {}
+    response = source.read_text().strip()
+    if not looks_like_final_review_response(response):
+        print("Imported response is not a GPT Pro final review response.", file=sys.stderr)
+        return 2
+    if not response_matches_run_text(response, status):
+        print("Imported response does not match this run topic/run id.", file=sys.stderr)
+        return 2
+    (run_dir / "response.md").write_text(response + "\n")
+    status.update(
+        {
+            "state": "completed_manual_import",
+            "manual_import": True,
+            "manual_import_source": str(source),
+            "response_chars": len(response),
+            "response_sha256": sha256_text(response),
+            "error": "",
+            "completed_at": now_iso(),
+        }
+    )
+    write_json(run_dir / "status.json", status)
+    print(run_dir)
+    return 0
+
+
 def list_runs() -> int:
     REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -1053,6 +1123,91 @@ def clean_runs(days: int) -> int:
             shutil.rmtree(path)
             count += 1
     print(f"Removed {count} GPT Pro review run packet(s) older than {days} day(s).")
+    return 0
+
+
+def resolve_run_dir(selector: str) -> Path:
+    value = Path(selector).expanduser()
+    return value.resolve() if value.is_absolute() else (RUN_DIR / selector).resolve()
+
+
+def issue_record_from_run(run_dir: Path, issue: str = "", source: str = "manual_handoff") -> dict[str, Any]:
+    status = load_json(run_dir / "status.json") or {}
+    conversation = load_json(run_dir / "conversation.json") or {}
+    response_path = run_dir / "response.md"
+    partial_path = run_dir / "response.partial.md"
+    upload_path = Path(status.get("upload_bundle") or "")
+    return {
+        "logged_at": now_iso(),
+        "source": source,
+        "issue": issue or status.get("error") or status.get("state") or "unspecified GPT Pro plugin issue",
+        "policy": "Non-plugin-maintenance threads must not modify plugin code; Computer Use is disabled by default and requires explicit current-thread approval.",
+        "next_action": "Use Chrome runtime resume/extract first, or gpt-review --import-response RUN_DIR --from-file PATH for a checked visible final answer; plugin-maintenance/root threads may patch/test the plugin if needed.",
+        "plugin_root": str(PLUGIN_ROOT),
+        "run_dir": str(run_dir),
+        "run_id": status.get("run_id", run_dir.name),
+        "state": status.get("state", ""),
+        "run_mode": status.get("run_mode", ""),
+        "topic": status.get("topic", ""),
+        "subtopics": status.get("subtopics", []),
+        "project_root": status.get("project_root", ""),
+        "session_root": status.get("session_root", ""),
+        "chatgpt_project": status.get("chatgpt_project", ""),
+        "project_url": status.get("project_url", ""),
+        "conversation_url": status.get("conversation_url") or conversation.get("url", ""),
+        "expected_conversation_url": status.get("expected_conversation_url", ""),
+        "last_browser_url": status.get("last_browser_url", ""),
+        "browser_title": status.get("browser_title", ""),
+        "error": status.get("error", ""),
+        "upload_confirmed": bool(status.get("upload_confirmed")),
+        "local_zip_deleted": bool(status.get("local_zip_deleted")),
+        "upload_bundle": str(upload_path) if upload_path else "",
+        "upload_bundle_exists": bool(upload_path and upload_path.exists()),
+        "response_exists": response_path.exists(),
+        "partial_response_exists": partial_path.exists(),
+        "keep_open": bool(status.get("keep_open")),
+        "detached_tab_preserved": bool(status.get("detached_tab_preserved")),
+        "chrome_handoff_required": status.get("state") == "chrome_handoff_required",
+    }
+
+
+def log_issue_run(selector: str, issue: str = "", source: str = "manual_handoff") -> int:
+    run_dir = resolve_run_dir(selector)
+    if not run_dir.exists():
+        print(f"runDir not found: {run_dir}", file=sys.stderr)
+        return 1
+    if not (run_dir / "status.json").exists():
+        print(f"status.json not found: {run_dir}", file=sys.stderr)
+        return 1
+    record = issue_record_from_run(run_dir, issue, source)
+    append_jsonl(ISSUE_LOG_PATH, record)
+    print(ISSUE_LOG_PATH)
+    print(json.dumps(redact_log_value(record), ensure_ascii=False, indent=2))
+    return 0
+
+
+def list_issue_log(limit: int = 20) -> int:
+    if not ISSUE_LOG_PATH.exists():
+        print(f"No GPT Pro plugin issue log: {ISSUE_LOG_PATH}")
+        return 0
+    lines = [line for line in ISSUE_LOG_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for line in lines[-max(1, limit):]:
+        try:
+            data = json.loads(line)
+        except Exception:
+            print(line)
+            continue
+        print(
+            "\t".join(
+                [
+                    str(data.get("logged_at", "")),
+                    str(data.get("state", "")),
+                    str(data.get("topic", "")),
+                    str(data.get("issue", ""))[:160],
+                    str(data.get("run_dir", "")),
+                ]
+            )
+        )
     return 0
 
 
@@ -1136,6 +1291,18 @@ def repair_registry(dry_run: bool) -> int:
     return 0
 
 
+def recovery_hint_for_state(state: str | None) -> dict[str, str]:
+    value = str(state or "")
+    hints = {
+        "manual_copy_required": "Use Chrome-runtime read-only extraction again if the original tab is available, or run: gpt-review --import-response RUN_DIR --from-file PATH",
+        "extract_failed": "Inspect response.partial.md, verify the visible final answer belongs to this run, then run: gpt-review --import-response RUN_DIR --from-file PATH",
+        "resume_tab_missing": "Reopen the recorded ChatGPT conversation URL manually, then retry Chrome runtime resume/extract. Do not open a duplicate run.",
+    }
+    if value not in hints:
+        return {}
+    return {"state": value, "next_action": hints[value]}
+
+
 def doctor() -> int:
     helper = chrome_helper_path()
     bin_path = Path("/opt/homebrew/bin/gpt-review")
@@ -1150,6 +1317,7 @@ def doctor() -> int:
         "runs": str(RUN_DIR),
         "registry": str(REGISTRY_DIR),
         "locks": str(LOCK_DIR),
+        "plugin_issue_log": str(ISSUE_LOG_PATH),
         "current_session_root": str(cwd_session["session_root"]),
         "current_project_key": route["project_key"],
         "current_project": route["chatgpt_project"],
@@ -1157,12 +1325,12 @@ def doctor() -> int:
         "current_project_route_source": route["project_route_source"],
         "default_project": DEFAULT_CHATGPT_PROJECT,
         "default_project_url": DEFAULT_CHATGPT_PROJECT_URL,
-        "example_project": EXAMPLE_CHATGPT_PROJECT,
-        "example_project_url": EXAMPLE_CHATGPT_PROJECT_URL,
+        "fixed_project_policy": "all paths route to the configured default Project by default; non-default project URLs require --allow-non-codex-project",
         "default_mode_label": DEFAULT_MODE_LABEL,
-        "mode_label_aliases": "深入",
         "conversation_policy": DEFAULT_CONVERSATION_POLICY,
         "reuse_existing_flag": "--reuse-existing",
+        "resume_missing_tab_policy": "fail_closed_no_auto_reopen",
+        "fallback_import_response": "gpt-review --import-response RUN_DIR --from-file PATH",
         "default_concurrency": DEFAULT_CONCURRENCY,
         "max_concurrency": MAX_CONCURRENCY,
         "chrome_helper": str(helper or "missing"),
@@ -1174,7 +1342,8 @@ def doctor() -> int:
         "plugin_cache_skill": str(PLUGIN_CACHE_SKILL_DIR) if (PLUGIN_CACHE_SKILL_DIR / "SKILL.md").exists() else "missing",
         "mcp_tool": "not_applicable_skill_and_cli",
         "trusted_chrome_runtime": "requires Codex Chrome skill / node_repl",
-        "browser_control_policy": "Chrome plugin first; Computer Use only for last-resort manual handoff",
+        "browser_control_policy": "Chrome plugin first; Computer Use disabled by default and requires explicit current-thread approval",
+        "plugin_maintenance_policy": "Non-plugin-maintenance threads must log handoff issues and must not edit plugin code.",
     }
     for key, value in checks.items():
         print(f"{key}: {value}")
@@ -1206,6 +1375,7 @@ def resume_run(args: argparse.Namespace) -> int:
         }, ensure_ascii=False, indent=2))
         return 1
     registry_url, stale = registry_conversation_for_project(registry, config)
+    recovery_hint = recovery_hint_for_state(registry.get("last_state") or registry.get("state"))
     print(json.dumps({
         "conversation_policy": DEFAULT_CONVERSATION_POLICY,
         "reuse_existing_flag": "--reuse-existing",
@@ -1213,6 +1383,7 @@ def resume_run(args: argparse.Namespace) -> int:
         "resolved_project": config,
         "registry": registry,
         "usable_conversation_url": registry_url,
+        **({"recovery_hint": recovery_hint} if recovery_hint else {}),
         **stale,
     }, ensure_ascii=False, indent=2))
     return 0
@@ -1271,7 +1442,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare and manage ChatGPT Pro web review runs.")
     parser.add_argument("prompt", nargs="*", help="Review prompt.")
     parser.add_argument("--project-root", help="Project root to bundle. Defaults to Git root or cwd.")
-    parser.add_argument("--session-root", help="Stable root for routing and optional explicit reuse. Defaults to an example_project workstream root or Git root.")
+    parser.add_argument("--session-root", help="Stable root for routing and optional explicit reuse. Defaults to example_project workstream root or Git root.")
     parser.add_argument("--topic", default=DEFAULT_TOPIC, help="Stable session topic. Default: default.")
     parser.add_argument("--exact-topic", action="store_true", help="Use --topic exactly instead of workstream-level canonicalization.")
     parser.add_argument("--subtopic", action="append", help="Current task label added to the prompt but not session key.")
@@ -1283,8 +1454,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="project-review",
         help="Review mode. Default: project-review.",
     )
-    parser.add_argument("--project-name", help="ChatGPT Project display name. Defaults to fixed path-based routing.")
-    parser.add_argument("--project-url", help="Exact ChatGPT Project URL. Overrides fixed path-based routing.")
+    parser.add_argument("--project-name", help="ChatGPT Project display name for an explicitly approved --project-url override.")
+    parser.add_argument("--project-url", help="Exact ChatGPT Project URL. Defaults to the fixed default Project and rejects non-default URLs unless confirmed.")
+    parser.add_argument(
+        "--allow-non-codex-project",
+        action="store_true",
+        help="Allow a non-default --project-url after explicit user confirmation. Default is fail-closed.",
+    )
     parser.add_argument("--mode-label", help=f"Required ChatGPT mode label. Default: {DEFAULT_MODE_LABEL}.")
     parser.add_argument(
         "--concurrency",
@@ -1310,8 +1486,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
     parser.add_argument("--max-bundle-bytes", type=int, default=DEFAULT_MAX_BUNDLE_BYTES)
     parser.add_argument("--finalize", help="Finalize a run directory after Chrome runner wrote response.md.")
+    parser.add_argument("--import-response", metavar="RUN_DIR|RUN_ID", help="Import a checked visible GPT final response from a text file into a run directory.")
+    parser.add_argument("--from-file", help="Text file containing the visible GPT final response for --import-response.")
     parser.add_argument("--show", metavar="RUN_ID|last", help="Show a saved response or status.")
     parser.add_argument("--list", action="store_true", help="List known GPT Pro review sessions.")
+    parser.add_argument("--log-issue", metavar="RUN_DIR|RUN_ID", help="Append a plugin handoff issue to the global maintenance log.")
+    parser.add_argument("--issue", help="Short issue summary for --log-issue.")
+    parser.add_argument("--list-issues", nargs="?", const=20, type=int, help="Show recent GPT Pro plugin issue log entries. Default: 20.")
     parser.add_argument("--clean", action="store_true", help="Remove old run packets.")
     parser.add_argument("--days", type=int, default=30, help="Age threshold for --clean.")
     parser.add_argument("--doctor", action="store_true", help="Check local setup.")
@@ -1333,10 +1514,19 @@ def main(argv: list[str] | None = None) -> int:
         return doctor()
     if args.list:
         return list_runs()
+    if args.list_issues is not None:
+        return list_issue_log(args.list_issues)
+    if args.log_issue:
+        return log_issue_run(args.log_issue, args.issue or "")
     if args.clean:
         return clean_runs(args.days)
     if args.show:
         return show_run(args.show)
+    if args.import_response:
+        if not args.from_file:
+            print("--import-response requires --from-file PATH", file=sys.stderr)
+            return 2
+        return import_response_run(args.import_response, args.from_file)
     if args.finalize:
         return finalize_run(Path(args.finalize))
     if args.resume:
